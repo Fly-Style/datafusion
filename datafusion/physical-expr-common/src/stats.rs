@@ -38,7 +38,7 @@ impl Default for StatisticsV2 {
 }
 
 impl StatisticsV2 {
-    pub fn new_unknown(&self) -> Self {
+    pub fn new_unknown() -> Self {
         Unknown {
             mean: None,
             median: None,

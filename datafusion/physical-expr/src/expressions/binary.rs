@@ -23,6 +23,8 @@ use std::{any::Any, sync::Arc};
 use crate::intervals::cp_solver::{propagate_arithmetic, propagate_comparison};
 use crate::PhysicalExpr;
 
+use crate::expressions::binary::kernels::concat_elements_utf8view;
+use crate::utils::stats::{compute_deviation, compute_mean, compute_median, new_unknown_from_known, new_unknown_with_range};
 use arrow::array::*;
 use arrow::compute::kernels::boolean::{and_kleene, not, or_kleene};
 use arrow::compute::kernels::cmp::*;
@@ -38,8 +40,10 @@ use datafusion_expr::sort_properties::ExprProperties;
 use datafusion_expr::type_coercion::binary::get_result_type;
 use datafusion_expr::{ColumnarValue, Operator};
 use datafusion_physical_expr_common::datum::{apply, apply_cmp, apply_cmp_for_nested};
-
-use crate::expressions::binary::kernels::concat_elements_utf8view;
+use datafusion_physical_expr_common::stats::StatisticsV2;
+use datafusion_physical_expr_common::stats::StatisticsV2::{
+    Exponential, Gaussian, Uniform, Unknown,
+};
 use kernels::{
     bitwise_and_dyn, bitwise_and_dyn_scalar, bitwise_or_dyn, bitwise_or_dyn_scalar,
     bitwise_shift_left_dyn, bitwise_shift_left_dyn_scalar, bitwise_shift_right_dyn,
@@ -392,6 +396,50 @@ impl PhysicalExpr for BinaryExpr {
         apply_operator(&self.op, left_interval, right_interval)
     }
 
+    fn evaluate_statistics(
+        &self,
+        children_stat: &[&StatisticsV2],
+    ) -> Result<StatisticsV2> {
+        let (left_stat, right_stat) = (children_stat[0], children_stat[1]);
+
+        match &self.op {
+            Operator::Plus | Operator::Minus | Operator::Multiply | Operator::Divide => {
+                match (left_stat, right_stat) {
+                    (Uniform { interval: left}, Uniform { interval: right, }) => Ok(Unknown {
+                        mean: compute_mean(&self.op, left_stat, right_stat)?,
+                        median: compute_median(&self.op, left_stat, right_stat)?,
+                        std_dev: compute_deviation(&self.op, left_stat, right_stat)?,
+                        range: apply_operator(&self.op, left, right)?,
+                    }),
+                    (Uniform {..}, _) | (_, Uniform {..}) => Ok(Unknown {
+                        mean: compute_mean(&self.op, left_stat, right_stat)?,
+                        median: compute_median(&self.op, left_stat, right_stat)?,
+                        std_dev: compute_deviation(&self.op, left_stat, right_stat)?,
+                        range: Interval::make_unbounded(&DataType::Float64)?,
+                    }),
+                    (Gaussian { mean: left_mean, variance: left_v, ..},
+                        Gaussian { mean: right_mean, variance: right_v}, ) => {
+                        if self.op.eq(&Operator::Plus) {
+                            Ok(Gaussian {
+                                mean: left_mean.add(right_mean)?,
+                                variance: left_v.add(right_v)?,
+                            })
+                        } else if self.op.eq(&Operator::Minus) {
+                            Ok(Gaussian {
+                                mean: left_mean.sub(right_mean)?,
+                                variance: left_v.add(right_v)?,
+                            })
+                        } else {
+                            return Ok(StatisticsV2::new_unknown())
+                        }
+                    }
+                    (_, _) => Ok(StatisticsV2::new_unknown())
+                }
+            }
+            _ => internal_err!("BinaryExpr requires exactly 2 children")
+        }
+    }
+
     fn propagate_constraints(
         &self,
         interval: &Interval,
@@ -491,6 +539,39 @@ impl PhysicalExpr for BinaryExpr {
                 propagate_arithmetic(&self.op, interval, left_interval, right_interval)?
                     .map(|(left, right)| vec![left, right]),
             )
+        }
+    }
+
+    fn propagate_statistics(
+        &self,
+        parent_stat: &StatisticsV2,
+        children_stat: &[&StatisticsV2],
+    ) -> Result<Option<Vec<StatisticsV2>>> {
+        if children_stat.len() != 2 {
+            return internal_err!("BinaryExpr requires exactly 2 children");
+        }
+
+        let (left_stat, right_stat) = (children_stat[0], children_stat[1]);
+
+        match parent_stat {
+            Uniform { .. } => {
+                if self.op.is_numerical_operators() {
+                    match (left_stat, right_stat) {
+                        (Uniform { .. }, Uniform { .. }) => Ok(Some(vec![
+                            new_unknown_from_known(left_stat)?,
+                            new_unknown_from_known(right_stat)?,
+                        ])),
+                        (Uniform { .. }, Exponential { .. }) => Ok(Some(vec![
+                            new_unknown_with_range(left_stat.range().unwrap().clone()),
+                            new_unknown_from_known(right_stat)?,
+                        ])),
+                        (_, _) => todo!(),
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            Exponential { .. } | Gaussian { .. } | Unknown { .. } => todo!(),
         }
     }
 
