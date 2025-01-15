@@ -164,37 +164,33 @@ impl StatisticsV2 {
     /// - [`Exponential`]'s variance is equal to mean value and calculable as 1/λ^2
     /// - [`Gaussian`]'s variance is available explicitly
     /// - [`Unknown`]'s distribution variance _may_ be present explicitly.
-    pub fn variance(&self) -> Option<ScalarValue> {
+    pub fn variance(&self) -> datafusion_common::Result<Option<ScalarValue>> {
         if !self.is_valid() {
-            return None;
+            return Ok(None);
         }
         match &self {
-            Uniform { interval, .. } => {
-                let base = interval.upper().sub_checked(interval.lower());
-                if base.is_err() {
-                    return None;
-                }
-                let base_value = &base.unwrap();
-                let base_pow = base_value.mul_checked(base_value);
-                if let Ok(res) = base_pow.unwrap().div(ScalarValue::Float64(Some(12.))) {
-                    Some(res)
+            Uniform { interval, .. } => { 
+                let base_value_ref = &interval.upper().sub_checked(interval.lower())?;
+                let base_pow = base_value_ref.mul_checked(base_value_ref);
+                if let Ok(res) = base_pow?.div(ScalarValue::Float64(Some(12.))) {
+                    Ok(Some(res))
                 } else {
-                    None
+                    Ok(None)
                 }
             }
             Exponential { rate, .. } => {
-                let one = &ScalarValue::new_one(&rate.data_type()).unwrap();
+                let one = &ScalarValue::new_one(&rate.data_type())?;
                 let rate_squared = rate.mul(rate);
                 if rate_squared.is_err() {
-                    return None;
+                    return Ok(None);
                 }
                 if let Ok(variance) = one.div(rate_squared.unwrap()) {
-                    return Some(variance);
+                    return Ok(Some(variance));
                 }
-                None
+                Ok(None)
             }
-            Gaussian { variance, .. } => Some(variance.clone()),
-            Unknown { variance, .. } => variance.clone()
+            Gaussian { variance, .. } => Ok(Some(variance.clone())),
+            Unknown { variance, .. } => Ok(variance.clone())
         }
     }
 
@@ -657,7 +653,7 @@ mod tests {
         //endregion
 
         for case in stats {
-            assert_eq!(case.0.variance(), case.1);
+            assert_eq!(case.0.variance().unwrap(), case.1);
         }
     }
 }

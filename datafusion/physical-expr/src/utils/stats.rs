@@ -2,11 +2,13 @@ use crate::expressions::Literal;
 use crate::physical_expr::PhysicalExpr;
 use crate::utils::{build_dag, ExprTreeNode};
 use arrow::datatypes::{DataType, Schema};
-use datafusion_common::{internal_err, ScalarValue};
-use datafusion_expr_common::interval_arithmetic::Interval;
+use datafusion_common::ScalarValue::Float64;
+use datafusion_common::ScalarValue;
+use datafusion_expr_common::interval_arithmetic::{apply_operator, Interval};
 use datafusion_expr_common::operator::Operator;
 use datafusion_physical_expr_common::stats::StatisticsV2;
-use datafusion_physical_expr_common::stats::StatisticsV2::{Uniform, Unknown};
+use datafusion_physical_expr_common::stats::StatisticsV2::{Exponential, Uniform, Unknown};
+use log::debug;
 use petgraph::adj::DefaultIx;
 use petgraph::prelude::Bfs;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
@@ -185,26 +187,19 @@ pub fn new_unknown_with_range(range: Interval) -> StatisticsV2 {
     }
 }
 
-/// Creates a new [`Unknown`] statistics instance from known statistics,
-/// with an attempt to infer or calculate the mean/median/std_dev and range
-/// from the known statistics.
-/// This builder is moved here due to original package visibility limitations.
-pub fn new_unknown_from_known(
-    statistics: &StatisticsV2,
+/// Creates a new [`Unknown`] distribution, and tries to compute
+/// mean/median/variance, if it is calculable.
+pub fn new_unknown_from_binary_expr(
+    op: &Operator,
+    left: &StatisticsV2,
+    right: &StatisticsV2,
+    range: Interval
 ) -> datafusion_common::Result<StatisticsV2> {
-    if let Some(interval) = statistics.range() {
-        return Ok(Unknown {
-            mean: statistics.mean()?,
-            median: statistics.median()?,
-            variance: statistics.variance(),
-            range: interval.clone(),
-        });
-    }
     Ok(Unknown {
-        mean: statistics.mean()?,
-        median: statistics.median()?,
-        variance: statistics.variance(),
-        range: Interval::make_unbounded(&DataType::Null)?,
+        mean: compute_mean(op, left, right)?,
+        median: compute_median(op, left, right)?,
+        variance: compute_variance(op, left, right)?,
+        range
     })
 }
 
@@ -220,8 +215,15 @@ pub fn compute_mean(
             Operator::Plus => Ok(Some(l_mean.add_checked(r_mean)?)),
             Operator::Minus => Ok(Some(l_mean.sub_checked(r_mean)?)),
             Operator::Multiply => Ok(Some(l_mean.mul_checked(r_mean)?)),
-            Operator::Divide => Ok(Some(l_mean.div(r_mean)?)),
-            _ => internal_err!("Unsupported operator for uniform distributions"),
+            Operator::Divide => {
+                // ((l_lower + l_upper) (log[r_lower] - log[r_upper)) / 2(c-d)
+                debug!("Division is not supported for mean computation; log() for ScalarValue is not supported");
+                Ok(None)
+            }
+            _ => {
+                debug!("Unsupported operator {op} for mean computation");
+                Ok(None)
+            },
         }
     } else {
         Ok(None)
@@ -231,7 +233,8 @@ pub fn compute_mean(
 /// Computes a median value for a given binary operator and two statistics.
 /// The median is calculable only between:
 /// [`Uniform`] and [`Uniform`] distributions,
-/// [`Gaussian`] and [`Gaussian`] distributions
+/// [`Gaussian`] and [`Gaussian`] distributions,
+/// and only for addition/subtraction.
 pub fn compute_median(
     op: &Operator,
     left_stat: &StatisticsV2,
@@ -239,12 +242,11 @@ pub fn compute_median(
 ) -> datafusion_common::Result<Option<ScalarValue>> {
     match (left_stat, right_stat) {
         (Uniform { .. }, Uniform { .. }) => {
-            if let (Some(l_mean), Some(r_mean)) = (left_stat.mean()?, right_stat.mean()?)
-            {
+            if let (Some(l_median), Some(r_median)) = (left_stat.median()?, right_stat.median()?) {
                 match op {
-                    Operator::Plus => Ok(Some(l_mean.add_checked(r_mean)?)),
-                    Operator::Minus => Ok(Some(l_mean.sub_checked(r_mean)?)),
-                    Operator::Multiply | Operator::Divide => Ok(None),
+                    Operator::Plus => Ok(Some(l_median.add_checked(r_median)?)),
+                    Operator::Minus => Ok(Some(l_median.sub_checked(r_median)?)),
+                    Operator::Multiply | Operator::Divide | Operator::Modulo => Ok(None),
                     _ => Ok(None)
                 }
             } else {
@@ -257,10 +259,122 @@ pub fn compute_median(
 }
 
 /// Computes a variance value for a given binary operator and two statistics.
+///
 pub fn compute_variance(
-    _op: &Operator,
-    _left_stat: &StatisticsV2,
-    _right_stat: &StatisticsV2,
+    op: &Operator,
+    left_stat: &StatisticsV2,
+    right_stat: &StatisticsV2,
 ) -> datafusion_common::Result<Option<ScalarValue>> {
-    todo!()
+    match (left_stat, right_stat) {
+        (Uniform { .. }, Uniform { .. }) => {
+            if let (Some(l_variance), Some(r_variance)) =
+                (left_stat.variance()?, right_stat.variance()?)
+            {
+                match op {
+                    Operator::Plus | Operator::Minus => Ok(Some(l_variance.add_checked(r_variance)?)),
+                    Operator::Multiply => {
+                        // TODO: the formula is giga-giant, skipping for now.
+                        debug!("Multiply operator is not supported for variance computation yet");
+                        Ok(None)
+                    },
+                    _ => {
+                        // Note: mod and div are not supported for any distribution combination pair
+                        debug!("Operator {op} cannot be supported for variance computation");
+                        Ok(None)
+                    },
+                }
+            } else {
+                Ok(None)
+            }
+        },
+        (Uniform { interval }, Exponential { rate, .. })
+        | (Exponential { rate, .. } , Uniform { interval }) => {
+            if let (Some(l_variance), Some(r_variance)) = (left_stat.mean()?, right_stat.mean()?) {
+                match op {
+                    Operator::Plus | Operator::Minus => Ok(Some(l_variance.add_checked(r_variance)?)),
+                    Operator::Multiply => {
+                        // (5 * lower^2 + 2 * lower * upper + 5 * upper^2) / 12 * λ^2
+                        let five = &Float64(Some(5.));
+                        // 5 * lower^2
+                        let interval_lower_sq = interval.lower()
+                            .mul_checked(interval.lower())?
+                            .cast_to(&DataType::Float64)?
+                            .mul_checked(five)?;
+                        // 5 * upper^2
+                        let interval_upper_sq = interval.upper()
+                            .mul_checked(interval.upper())?
+                            .cast_to(&DataType::Float64)?
+                            .mul_checked(five)?;
+                        // 2 * lower * upper
+                        let middle = interval.upper()
+                            .mul_checked(interval.lower())?
+                            .cast_to(&DataType::Float64)?
+                            .mul_checked(Float64(Some(2.)))?;
+
+                        let numerator = interval_lower_sq
+                            .add_checked(interval_upper_sq)?
+                            .add_checked(middle)?;
+                        let denominator = Float64(Some(12.))
+                            .mul_checked(rate.mul(rate)?.cast_to(&DataType::Float64)?)?;
+
+                        Ok(Some(numerator.div(denominator)?))
+                    }
+                    _ => {
+                        // Note: mod and div are not supported for any distribution combination pair
+                        debug!("Unsupported operator {op} for variance computation");
+                        Ok(None)
+                    },
+                }
+            } else {
+                Ok(None)
+            }
+        },
+        (_, _) => todo!()
+    }
+}
+
+#[cfg(test)]
+// #[cfg(all(test, feature = "stats_v2"))]
+mod tests {
+    use crate::utils::stats::{compute_mean, compute_median, compute_variance};
+    use datafusion_common::ScalarValue;
+    use datafusion_common::ScalarValue::Float64;
+    use datafusion_expr_common::interval_arithmetic::Interval;
+    use datafusion_expr_common::operator::Operator;
+    use datafusion_physical_expr_common::stats::StatisticsV2::Uniform;
+
+    type Actual = Option<ScalarValue>;
+    type Expected = Option<ScalarValue>;
+
+    #[test]
+    fn test_uniform_uniform() {
+        let stat_a = Uniform {
+            interval: Interval::make(Some(0.), Some(12.0)).unwrap()
+        };
+
+        let stat_b = Uniform {
+            interval: Interval::make(Some(12.0), Some(36.0)).unwrap()
+        };
+
+        let test_data: Vec<(Actual, Expected)> = vec![
+            // mean
+            (compute_mean(&Operator::Plus, &stat_a, &stat_b).unwrap(), Some(Float64(Some(30.)))),
+            (compute_mean(&Operator::Minus, &stat_a, &stat_b).unwrap(), Some(Float64(Some(-18.)))),
+            (compute_mean(&Operator::Multiply, &stat_a, &stat_b).unwrap(), Some(Float64(Some(144.)))),
+
+            // median
+            (compute_median(&Operator::Plus, &stat_a, &stat_b).unwrap(), Some(Float64(Some(30.)))),
+            (compute_median(&Operator::Minus, &stat_a, &stat_b).unwrap(), Some(Float64(Some(-18.)))),
+            // FYI: median of combined distributions for mul, div and mod ops doesn't exist.
+
+            // variance
+            (compute_variance(&Operator::Plus, &stat_a, &stat_b).unwrap(), Some(Float64(Some(60.)))),
+            (compute_variance(&Operator::Minus, &stat_a, &stat_b).unwrap(), Some(Float64(Some(60.)))),
+            // (compute_variance(&Operator::Multiply, &stat_a, &stat_b).unwrap(), Some(Float64(Some(9216.)))),
+        ];
+
+        for (actual, expected) in test_data {
+            assert_eq!(actual, expected);
+        }
+    }
 }
