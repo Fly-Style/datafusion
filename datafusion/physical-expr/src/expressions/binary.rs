@@ -24,7 +24,7 @@ use crate::intervals::cp_solver::{propagate_arithmetic, propagate_comparison};
 use crate::PhysicalExpr;
 
 use crate::expressions::binary::kernels::concat_elements_utf8view;
-use crate::utils::stats::{compute_deviation, compute_mean, compute_median, new_unknown_from_known, new_unknown_with_range};
+use crate::utils::stats::{compute_mean, compute_median, compute_variance, new_unknown_from_known, new_unknown_with_range};
 use arrow::array::*;
 use arrow::compute::kernels::boolean::{and_kleene, not, or_kleene};
 use arrow::compute::kernels::cmp::*;
@@ -408,13 +408,13 @@ impl PhysicalExpr for BinaryExpr {
                     (Uniform { interval: left}, Uniform { interval: right, }) => Ok(Unknown {
                         mean: compute_mean(&self.op, left_stat, right_stat)?,
                         median: compute_median(&self.op, left_stat, right_stat)?,
-                        std_dev: compute_deviation(&self.op, left_stat, right_stat)?,
+                        variance: compute_variance(&self.op, left_stat, right_stat)?,
                         range: apply_operator(&self.op, left, right)?,
                     }),
                     (Uniform {..}, _) | (_, Uniform {..}) => Ok(Unknown {
                         mean: compute_mean(&self.op, left_stat, right_stat)?,
                         median: compute_median(&self.op, left_stat, right_stat)?,
-                        std_dev: compute_deviation(&self.op, left_stat, right_stat)?,
+                        variance: compute_variance(&self.op, left_stat, right_stat)?,
                         range: Interval::make_unbounded(&DataType::Float64)?,
                     }),
                     (Gaussian { mean: left_mean, variance: left_v, ..},

@@ -75,7 +75,7 @@ impl ExprStatisticGraphNode {
             statistics: Unknown {
                 mean: None,
                 median: None,
-                std_dev: None,
+                variance: None,
                 range: Interval::make_unbounded(dt)?,
             },
         })
@@ -180,7 +180,7 @@ pub fn new_unknown_with_range(range: Interval) -> StatisticsV2 {
     Unknown {
         mean: None,
         median: None,
-        std_dev: None,
+        variance: None,
         range,
     }
 }
@@ -196,14 +196,14 @@ pub fn new_unknown_from_known(
         return Ok(Unknown {
             mean: statistics.mean()?,
             median: statistics.median()?,
-            std_dev: statistics.std_dev()?,
+            variance: statistics.variance(),
             range: interval.clone(),
         });
     }
     Ok(Unknown {
         mean: statistics.mean()?,
         median: statistics.median()?,
-        std_dev: statistics.std_dev()?,
+        variance: statistics.variance(),
         range: Interval::make_unbounded(&DataType::Null)?,
     })
 }
@@ -256,11 +256,11 @@ pub fn compute_median(
     }
 }
 
-/// Computes a standard deviation value for a given binary operator and two statistics.
-pub fn compute_deviation(
+/// Computes a variance value for a given binary operator and two statistics.
+pub fn compute_variance(
     _op: &Operator,
     _left_stat: &StatisticsV2,
     _right_stat: &StatisticsV2,
 ) -> datafusion_common::Result<Option<ScalarValue>> {
-    todo!("Implement sqrt() function function for ScalarValue, most calculations are based on it");
+    todo!()
 }

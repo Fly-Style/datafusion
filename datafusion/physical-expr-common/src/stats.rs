@@ -21,7 +21,7 @@ pub enum StatisticsV2 {
     Unknown {
         mean: Option<ScalarValue>,
         median: Option<ScalarValue>,
-        std_dev: Option<ScalarValue>, // standard deviation
+        variance: Option<ScalarValue>,
         range: Interval,
     },
 }
@@ -31,7 +31,7 @@ impl Default for StatisticsV2 {
         Unknown {
             mean: None,
             median: None,
-            std_dev: None,
+            variance: None,
             range: Interval::make_unbounded(&DataType::Null).unwrap(),
         }
     }
@@ -42,8 +42,8 @@ impl StatisticsV2 {
         Unknown {
             mean: None,
             median: None,
-            std_dev: None,
-            range: Interval::make_unbounded(&DataType::Null).unwrap(),
+            variance: None,
+            range: Interval::make_zero(&DataType::Null).unwrap(),
         }
     }
 
@@ -72,7 +72,7 @@ impl StatisticsV2 {
             Unknown {
                 mean,
                 median,
-                std_dev,
+                variance: std_dev,
                 range,
             } => {
                 if let (Some(mn), Some(md)) = (mean, median) {
@@ -159,45 +159,42 @@ impl StatisticsV2 {
         }
     }
 
-    /// Extract the standard deviation of given statistic distribution:
-    /// - [`Exponential`]'s standard deviation is equal to mean value and calculable as 1/λ
-    /// - [`Gaussian`]'s standard deviation is a square root of variance.
-    /// - [`Unknown`]'s distribution standard deviation _may_ be present explicitly.
-    pub fn std_dev(&self) -> datafusion_common::Result<Option<ScalarValue>> {
+    /// Extract the variance of given statistic distribution:
+    /// - [`Uniform`]'s variance is equal to (upper-lower)^2 / 12
+    /// - [`Exponential`]'s variance is equal to mean value and calculable as 1/λ^2
+    /// - [`Gaussian`]'s variance is available explicitly
+    /// - [`Unknown`]'s distribution variance _may_ be present explicitly.
+    pub fn variance(&self) -> Option<ScalarValue> {
         if !self.is_valid() {
-            return Ok(None);
+            return None;
         }
         match &self {
-            Uniform { interval } => {
-                let agg = interval
-                    .upper()
-                    .sub_checked(interval.lower())?
-                    .cast_to(&DataType::Float64)?;
-
-                // TODO: move, if possible, to a constant
-                let two_times_sqrt_three = ScalarValue::Float64(Some(3f64.sqrt()))
-                    .mul(ScalarValue::Float64(Some(2.)))?;
-
-                if let Ok(std_dev) = agg.div(two_times_sqrt_three) {
-                    return Ok(Some(std_dev));
+            Uniform { interval, .. } => {
+                let base = interval.upper().sub_checked(interval.lower());
+                if base.is_err() {
+                    return None;
                 }
-                Ok(None)
+                let base_value = &base.unwrap();
+                let base_pow = base_value.mul_checked(base_value);
+                if let Ok(res) = base_pow.unwrap().div(ScalarValue::Float64(Some(12.))) {
+                    Some(res)
+                } else {
+                    None
+                }
             }
             Exponential { rate, .. } => {
-                let one = &ScalarValue::new_one(&rate.data_type())?;
-                if let Ok(std_dev) = one.div(rate) {
-                    return Ok(Some(std_dev));
+                let one = &ScalarValue::new_one(&rate.data_type()).unwrap();
+                let rate_squared = rate.mul(rate);
+                if rate_squared.is_err() {
+                    return None;
                 }
-                Ok(None)
+                if let Ok(variance) = one.div(rate_squared.unwrap()) {
+                    return Some(variance);
+                }
+                None
             }
-            Gaussian {
-                variance: _variance,
-                ..
-            } => {
-                // TODO: sqrt() is not yet implemented for ScalarValue
-                Ok(None)
-            }
-            Unknown { std_dev, .. } => Ok(std_dev.clone())
+            Gaussian { variance, .. } => Some(variance.clone()),
+            Unknown { variance, .. } => variance.clone()
         }
     }
 
@@ -342,7 +339,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: None,
                     median: None,
-                    std_dev: None,
+                    variance: None,
                     range: Interval::make_zero(&DataType::Float32).unwrap(),
                 },
                 false,
@@ -351,7 +348,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: Some(ScalarValue::Float32(Some(0.))),
                     median: None,
-                    std_dev: None,
+                    variance: None,
                     range: Interval::make_zero(&DataType::Float32).unwrap(),
                 },
                 false,
@@ -360,7 +357,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: None,
                     median: Some(ScalarValue::Float32(Some(0.))),
-                    std_dev: None,
+                    variance: None,
                     range: Interval::make_zero(&DataType::Float32).unwrap(),
                 },
                 false,
@@ -369,7 +366,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: Some(ScalarValue::Null),
                     median: Some(ScalarValue::Null),
-                    std_dev: Some(ScalarValue::Null),
+                    variance: Some(ScalarValue::Null),
                     range: Interval::make_zero(&DataType::Float32).unwrap(),
                 },
                 false,
@@ -378,7 +375,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: Some(ScalarValue::Float32(Some(0.))),
                     median: Some(ScalarValue::Float32(Some(0.))),
-                    std_dev: None,
+                    variance: None,
                     range: Interval::make_zero(&DataType::Float32).unwrap(),
                 },
                 true,
@@ -387,7 +384,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: Some(ScalarValue::Float64(Some(50.))),
                     median: Some(ScalarValue::Float64(Some(50.))),
-                    std_dev: None,
+                    variance: None,
                     range: Interval::make(Some(0.), Some(100.)).unwrap(),
                 },
                 true,
@@ -396,7 +393,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: Some(ScalarValue::Float64(Some(50.))),
                     median: Some(ScalarValue::Float64(Some(50.))),
-                    std_dev: None,
+                    variance: None,
                     range: Interval::make(Some(-100.), Some(0.)).unwrap(),
                 },
                 false,
@@ -405,7 +402,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: None,
                     median: None,
-                    std_dev: Some(ScalarValue::Float64(Some(1.))),
+                    variance: Some(ScalarValue::Float64(Some(1.))),
                     range: Interval::make_zero(&DataType::Float64).unwrap(),
                 },
                 true,
@@ -414,7 +411,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: None,
                     median: None,
-                    std_dev: Some(ScalarValue::Float64(Some(-1.))),
+                    variance: Some(ScalarValue::Float64(Some(-1.))),
                     range: Interval::make_zero(&DataType::Float64).unwrap(),
                 },
                 false,
@@ -496,7 +493,7 @@ mod tests {
             StatisticsV2::Unknown {
                 mean: None,
                 median: None,
-                std_dev: None,
+                variance: None,
                 range: Interval::make_zero(&DataType::Int8).unwrap(),
             },
             None,
@@ -506,7 +503,7 @@ mod tests {
             StatisticsV2::Unknown {
                 mean: Some(ScalarValue::Float64(Some(42.))),
                 median: None,
-                std_dev: None,
+                variance: None,
                 range: Interval::make_zero(&DataType::Float64).unwrap(),
             },
             None,
@@ -516,7 +513,7 @@ mod tests {
             StatisticsV2::Unknown {
                 mean: Some(ScalarValue::Float64(Some(42.))),
                 median: Some(ScalarValue::Float64(Some(42.))),
-                std_dev: None,
+                variance: None,
                 range: Interval::make_zero(&DataType::Float64).unwrap(),
             },
             None,
@@ -525,7 +522,7 @@ mod tests {
             StatisticsV2::Unknown {
                 mean: Some(ScalarValue::Float64(Some(42.))),
                 median: Some(ScalarValue::Float64(Some(42.))),
-                std_dev: None,
+                variance: None,
                 range: Interval::make(Some(25.), Some(50.)).unwrap(),
             },
             Some(ScalarValue::Float64(Some(42.))),
@@ -547,7 +544,7 @@ mod tests {
                     interval: Interval::make_zero(&DataType::Int64).unwrap(),
                 },
                 Some(ScalarValue::Float64(Some(0.))),
-            ),            
+            ),
             (
                 StatisticsV2::Uniform {
                     interval: Interval::make(Some(25.), Some(75.)).unwrap(),
@@ -572,7 +569,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: None,
                     median: None,
-                    std_dev: None,
+                    variance: None,
                     range: Interval::make_zero(&DataType::Int8).unwrap(),
                 },
                 None,
@@ -582,7 +579,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: None,
                     median: Some(ScalarValue::Float64(Some(12.))),
-                    std_dev: None,
+                    variance: None,
                     range: Interval::make_zero(&DataType::Float64).unwrap(),
                 },
                 None,
@@ -592,7 +589,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: None,
                     median: Some(ScalarValue::Float64(Some(12.))),
-                    std_dev: None,
+                    variance: None,
                     range: Interval::make_zero(&DataType::Float64).unwrap(),
                 },
                 None,
@@ -601,7 +598,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: Some(ScalarValue::Float64(Some(12.))),
                     median: Some(ScalarValue::Float64(Some(12.))),
-                    std_dev: None,
+                    variance: None,
                     range: Interval::make(Some(0.), Some(25.)).unwrap(),
                 },
                 Some(ScalarValue::Float64(Some(12.))),
@@ -614,34 +611,34 @@ mod tests {
     }
 
     #[test]
-    fn std_dev_extraction_test() {
-        // The test data is placed as follows: (stat -> expected answer)
+    fn variance_extraction_test() {
+        // The test data is placed as follows : (stat -> expected answer)
         let stats = vec![
             (
                 StatisticsV2::Uniform {
-                    interval: Interval::make_zero(&DataType::Int64).unwrap(),
+                    interval: Interval::make(Some(0.), Some(12.)).unwrap(),
                 },
-                Some(ScalarValue::Float64(Some(0.))),
+                Some(ScalarValue::Float64(Some(12.))),
             ),
             (
                 StatisticsV2::Exponential {
                     rate: ScalarValue::Float64(Some(10.)),
                     offset: ScalarValue::Float64(Some(0.)),
                 },
-                Some(ScalarValue::Float64(Some(0.1))),
+                Some(ScalarValue::Float64(Some(0.01))),
             ),
             (
                 StatisticsV2::Gaussian {
                     mean: ScalarValue::Float64(Some(0.)),
                     variance: ScalarValue::Float64(Some(1.)),
                 },
-                None,
+                Some(ScalarValue::Float64(Some(1.))),
             ),
             (
                 StatisticsV2::Unknown {
                     mean: None,
                     median: None,
-                    std_dev: None,
+                    variance: None,
                     range: Interval::make_zero(&DataType::Int8).unwrap(),
                 },
                 None,
@@ -650,7 +647,7 @@ mod tests {
                 StatisticsV2::Unknown {
                     mean: None,
                     median: None,
-                    std_dev: Some(ScalarValue::Float64(Some(0.02))),
+                    variance: Some(ScalarValue::Float64(Some(0.02))),
                     range: Interval::make_zero(&DataType::Float64).unwrap(),
                 },
                 Some(ScalarValue::Float64(Some(0.02))),
@@ -660,7 +657,7 @@ mod tests {
         //endregion
 
         for case in stats {
-            assert_eq!(case.0.std_dev().unwrap(), case.1);
+            assert_eq!(case.0.variance(), case.1);
         }
     }
 }
