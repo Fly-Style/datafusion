@@ -144,6 +144,7 @@ pub fn all_default_scalar_functions() -> Vec<Arc<ScalarUDF>> {
         .chain(function::math::functions())
         .chain(function::misc::functions())
         .chain(function::predicate::functions())
+        .chain(function::regexp::functions())
         .chain(function::string::functions())
         .chain(function::r#struct::functions())
         .chain(function::url::functions())

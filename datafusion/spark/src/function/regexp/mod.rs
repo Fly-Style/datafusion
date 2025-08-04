@@ -31,7 +31,7 @@ pub mod expr_fn {
         "Extract a specific group matched by the Java regex, from the specified string column.\
          If the regex did not match, or the specified group did not match, \
          an empty string is returned.",
-        str pattern idx
+        str regexp idx
     ));
 }
 

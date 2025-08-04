@@ -32,7 +32,7 @@ pub mod map;
 pub mod math;
 pub mod misc;
 pub mod predicate;
-pub mod regex;
+pub mod regexp;
 pub mod string;
 pub mod r#struct;
 pub mod table;

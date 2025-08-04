@@ -18,7 +18,7 @@
 use arrow::array::{Array, AsArray, StringArray};
 use arrow::datatypes::DataType;
 use datafusion_common::utils::take_function_args;
-use datafusion_common::{exec_err, Result, ScalarValue};
+use datafusion_common::{exec_err, plan_err, Result, ScalarValue};
 use datafusion_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
@@ -26,8 +26,11 @@ use regex::Regex;
 use std::any::Any;
 use std::sync::Arc;
 
-/// Spark-compatible `regexp_extract` expression
-/// <https://spark.apache.org/docs/latest/api/sql/index.html#regexp_extract>
+/// `regexp_extract` expression implementation in both original Spark and PySpark compatible manner.
+///
+/// Original Spark: <https://spark.apache.org/docs/latest/api/sql/index.html#regexp_extract>
+///
+/// PySpark: <https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.regexp_extract.html>
 #[derive(Debug)]
 pub struct SparkRegexpExtract {
     signature: Signature,
@@ -66,18 +69,17 @@ impl ScalarUDFImpl for SparkRegexpExtract {
             DataType::Utf8 | DataType::Utf8View => DataType::Utf8,
             other => {
                 return exec_err!(
-                    "The regexp_extract function can only accept strings. Got {other}"
+                    "The regexp_extract function can only return strings. Got {other}"
                 );
             }
         })
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let [str_arg, pattern_arg, idx_arg] =
-            take_function_args(self.name(), &args.args)?;
+        let [str_arg, regexp_arg, idx_arg] = take_function_args(self.name(), &args.args)?;
 
         // Extract pattern and index from arguments
-        let pattern = match pattern_arg {
+        let regexp = match regexp_arg {
             ColumnarValue::Scalar(ScalarValue::Utf8(Some(p)))
             | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(p)))
             | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(p))) => p,
@@ -88,38 +90,38 @@ impl ScalarUDFImpl for SparkRegexpExtract {
             }
             _ => {
                 return exec_err!(
-                    "Pattern argument must be a scalar string for function `{}`",
+                    "'regexp' argument must be a scalar string for function `{}`",
                     self.name()
                 )
             }
         };
 
-        let Ok(regex) = Regex::new(pattern) else {
+        let Ok(regex) = Regex::new(regexp) else {
             // If the regex is invalid, return None
             return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None)));
         };
 
         let idx = match idx_arg {
-            // TODO: observe if non-coerced types are passed here.
-            ColumnarValue::Scalar(ScalarValue::Int64(Some(i))) => {
-                if *i >= 0 {
-                    *i as usize
-                } else {
+            ColumnarValue::Scalar(ScalarValue::Int64(Some(idx))) => {
+                if *idx < 0 {
                     return exec_err!(
                         "Index argument must be a non-negative integer for function `{}`",
                         self.name()
                     );
                 }
+                *idx as usize
             }
             _ => {
                 return exec_err!(
-                    "Index argument must be an integer for function `{}`",
+                    "'idx' argument must be an integer for function `{}`",
                     self.name()
                 )
             }
         };
 
+        // We care both about column reference and scalar string
         match str_arg {
+            // PySpark way
             ColumnarValue::Array(array) => match array.data_type() {
                 DataType::Utf8 => {
                     let str_array = array.as_string::<i32>();
@@ -152,6 +154,7 @@ impl ScalarUDFImpl for SparkRegexpExtract {
                     )
                 }
             },
+            // Original Spark way
             ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
             | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s)))
             | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(s))) => {
@@ -170,6 +173,50 @@ impl ScalarUDFImpl for SparkRegexpExtract {
                 )
             }
         }
+    }
+
+    /// Manual type check & coercion of the function arguments for the sake of SQL support.
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        let [input_type, regexp_type, idx_type] = arg_types else {
+            return plan_err!(
+                "The {} function requires 3 argument, but got {}.",
+                self.name(),
+                arg_types.len()
+            );
+        };
+
+        if !matches!(
+            regexp_type,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
+            return plan_err!(
+                "'regexp' argument must be a string for function `{}`",
+                self.name()
+            );
+        }
+
+        if !matches!(
+            regexp_type,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
+            return plan_err!(
+                "'regexp' argument must be a string for function `{}`",
+                self.name()
+            );
+        }
+
+        if !idx_type.is_integer() {
+            return plan_err!(
+                "'idx' argument must be an integer for function `{}`",
+                self.name()
+            );
+        }
+
+        Ok(vec![
+            input_type.clone(),
+            regexp_type.clone(),
+            DataType::Int64,
+        ])
     }
 }
 
@@ -237,6 +284,56 @@ mod tests {
                 3
             ),
             "com"
+        );
+    }
+
+    #[test]
+    fn test_unicode_characters() {
+        // Test with Unicode characters
+        assert_eq!(
+            regexp_extract_impl("こんにちは世界", &Regex::new("(こんにちは)(世界)").unwrap(), 1),
+            "こんにちは"
+        );
+        assert_eq!(
+            regexp_extract_impl("こんにちは世界", &Regex::new("(こんにちは)(世界)").unwrap(), 2),
+            "世界"
+        );
+        assert_eq!(
+            regexp_extract_impl("😀😃😄", &Regex::new("(😀)(😃)(😄)").unwrap(), 2),
+            "😃"
+        );
+    }
+
+    #[test]
+    fn test_special_regex_syntax() {
+        // Test with non-capturing groups
+        assert_eq!(
+            regexp_extract_impl("abc123", &Regex::new("(a)(?:bc)(\\d+)").unwrap(), 1),
+            "a"
+        );
+        assert_eq!(
+            regexp_extract_impl("abc123", &Regex::new("(a)(?:bc)(\\d+)").unwrap(), 2),
+            "123"
+        );
+
+        // Test with character classes
+        assert_eq!(
+            regexp_extract_impl("abc123", &Regex::new("([a-z]+)([0-9]+)").unwrap(), 1),
+            "abc"
+        );
+        assert_eq!(
+            regexp_extract_impl("abc123", &Regex::new("([a-z]+)([0-9]+)").unwrap(), 2),
+            "123"
+        );
+
+        // Test with word boundaries
+        assert_eq!(
+            regexp_extract_impl("abc 123", &Regex::new("\\b([a-z]+)\\b").unwrap(), 1),
+            "abc"
+        );
+        assert_eq!(
+            regexp_extract_impl("abc 123", &Regex::new("\\b([0-9]+)\\b").unwrap(), 1),
+            "123"
         );
     }
 
@@ -379,7 +476,8 @@ mod tests {
         let arg_fields = vec![
             FieldRef::new(Field::new("str", DataType::Utf8, true)),
             FieldRef::new(Field::new("pattern", DataType::Utf8, true)),
-            FieldRef::new(Field::new("idx", DataType::Int64, true)),
+            // Proves that idx can be coerced to Int64
+            FieldRef::new(Field::new("idx", DataType::Int8, true)),
         ];
 
         let return_field = FieldRef::new(Field::new("result", DataType::Utf8, true));
@@ -419,6 +517,84 @@ mod tests {
     }
 
     #[test]
+    fn test_regexp_extract_scalar_invocation_edge_cases() {
+        // Integration test for various edge cases
+        let invocation_args = [
+            // Empty regex pattern
+            (Some("abc".to_string()), Some("".to_string()), Some(0)),
+            // Unicode characters
+            (Some("こんにちは世界".to_string()), Some("(こんにちは)(世界)".to_string()), Some(2)),
+            // Emoji characters
+            (Some("😀😃😄".to_string()), Some("(😀)(😃)(😄)".to_string()), Some(3)),
+            // Extremely large index
+            (Some("abc".to_string()), Some("(a)(b)(c)".to_string()), Some(999)),
+            // Multiple matches (only first match is returned)
+            (Some("abc abc abc".to_string()), Some("(abc)".to_string()), Some(1)),
+            // Sequential capture groups (not truly overlapping)
+            (Some("abcde".to_string()), Some("(a)(b)(c)(d)(e)".to_string()), Some(2)),
+            // Nested capture groups
+            (Some("abcde".to_string()), Some("(a(b(c)d)e)".to_string()), Some(3)),
+            // Character classes
+            (Some("abc123".to_string()), Some("([a-z]+)([0-9]+)".to_string()), Some(1)),
+            // Special regex syntax - non-capturing group
+            (Some("abc123".to_string()), Some("(a)(?:bc)(\\d+)".to_string()), Some(2)),
+        ];
+
+        let expected = [
+            Some(""),
+            Some("世界"),
+            Some("😄"),
+            Some(""),
+            Some("abc"),
+            Some("b"),
+            Some("c"),
+            Some("abc"),
+            Some("123"),
+        ];
+
+        let arg_fields = vec![
+            FieldRef::new(Field::new("str", DataType::Utf8, true)),
+            FieldRef::new(Field::new("pattern", DataType::Utf8, true)),
+            FieldRef::new(Field::new("idx", DataType::Int64, true)),
+        ];
+
+        let return_field = FieldRef::new(Field::new("result", DataType::Utf8, true));
+
+        for i in 0..invocation_args.len() {
+            let (input, pattern, idx) = &invocation_args[i];
+
+            let args = ScalarFunctionArgs {
+                args: vec![
+                    ColumnarValue::Scalar(ScalarValue::Utf8(input.clone())),
+                    ColumnarValue::Scalar(ScalarValue::Utf8(pattern.clone())),
+                    ColumnarValue::Scalar(ScalarValue::Int64(*idx)),
+                ],
+                arg_fields: arg_fields.clone(),
+                number_rows: 1,
+                return_field: Arc::clone(&return_field),
+            };
+
+            let udf = SparkRegexpExtract::new();
+
+            let res = udf.invoke_with_args(args).unwrap();
+            let actual = match res {
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => s,
+                ColumnarValue::Scalar(ScalarValue::Utf8(None)) => String::new(),
+                _ => panic!("Expected ScalarValue::Utf8"),
+            };
+            let expected = expected[i]
+                .as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+
+            assert_eq!(
+                expected, actual,
+                "At index {i}: expected '{expected}', got '{actual}'"
+            );
+        }
+    }
+
+    #[test]
     fn test_regexp_extract_array_invocation() {
         let target_arr = StringArray::from(vec![
             Some("100-200"),
@@ -428,7 +604,7 @@ mod tests {
             Some("700-800"),
         ]);
 
-        let pattern = Some(r"(\d+)-(\d+)".to_string());
+        let regexp = Some(r"(\d+)-(\d+)".to_string());
         let idx = Some(2); // expecting to extract the second group
 
         let expected = [
@@ -450,7 +626,7 @@ mod tests {
         let args = ScalarFunctionArgs {
             args: vec![
                 ColumnarValue::Array(Arc::new(target_arr)),
-                ColumnarValue::Scalar(ScalarValue::Utf8(pattern)),
+                ColumnarValue::Scalar(ScalarValue::Utf8(regexp)),
                 ColumnarValue::Scalar(ScalarValue::Int64(idx)),
             ],
             arg_fields: arg_fields.clone(),
@@ -473,7 +649,7 @@ mod tests {
                 assert!(expected[i].is_none(), "Expected None at index {i}");
             } else {
                 // Sanity check
-                assert!(!expected[i].is_none(), "Expected Some at index {i}");
+                assert!(expected[i].is_some(), "Expected Some at index {i}");
 
                 let actual = actual_arr.value(i);
                 let expected = expected[i].as_ref().unwrap().as_str();
