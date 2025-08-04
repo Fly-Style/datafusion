@@ -15,28 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod aggregate;
-pub mod array;
-pub mod bitwise;
-pub mod collection;
-pub mod conditional;
-pub mod conversion;
-pub mod csv;
-pub mod datetime;
-pub mod error_utils;
-pub mod generator;
-pub mod hash;
-pub mod json;
-pub mod lambda;
-pub mod map;
-pub mod math;
-pub mod misc;
-pub mod predicate;
-pub mod regex;
-pub mod string;
-pub mod r#struct;
-pub mod table;
-pub mod url;
-pub mod utils;
-pub mod window;
-pub mod xml;
+use datafusion_expr::ScalarUDF;
+use datafusion_functions::make_udf_function;
+use std::sync::Arc;
+
+pub mod regexp_extract;
+
+make_udf_function!(regexp_extract::SparkRegexpExtract, regexp_extract);
+
+pub mod expr_fn {
+    use datafusion_functions::export_functions;
+
+    export_functions!((
+        regexp_extract,
+        "Extract a specific group matched by the Java regex, from the specified string column.\
+         If the regex did not match, or the specified group did not match, \
+         an empty string is returned.",
+        str pattern idx
+    ));
+}
+
+pub fn functions() -> Vec<Arc<ScalarUDF>> {
+    vec![regexp_extract()]
+}
