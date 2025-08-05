@@ -28,7 +28,8 @@ use std::sync::Arc;
 
 /// `regexp_extract` expression implementation in both original Spark and PySpark compatible manner.
 ///
-/// Original Spark: <https://spark.apache.org/docs/latest/api/sql/index.html#regexp_extract>
+/// Original Spark: <https://spark.apache.org/docs/latest/api/sql/index.html#regexp_extract>.
+/// As a trade-off, we always expect the 'idx' argument to be present as integer.
 ///
 /// PySpark: <https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.regexp_extract.html>
 #[derive(Debug)]
