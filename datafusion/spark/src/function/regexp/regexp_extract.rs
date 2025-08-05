@@ -291,11 +291,19 @@ mod tests {
     fn test_unicode_characters() {
         // Test with Unicode characters
         assert_eq!(
-            regexp_extract_impl("こんにちは世界", &Regex::new("(こんにちは)(世界)").unwrap(), 1),
+            regexp_extract_impl(
+                "こんにちは世界",
+                &Regex::new("(こんにちは)(世界)").unwrap(),
+                1
+            ),
             "こんにちは"
         );
         assert_eq!(
-            regexp_extract_impl("こんにちは世界", &Regex::new("(こんにちは)(世界)").unwrap(), 2),
+            regexp_extract_impl(
+                "こんにちは世界",
+                &Regex::new("(こんにちは)(世界)").unwrap(),
+                2
+            ),
             "世界"
         );
         assert_eq!(
@@ -523,21 +531,53 @@ mod tests {
             // Empty regex pattern
             (Some("abc".to_string()), Some("".to_string()), Some(0)),
             // Unicode characters
-            (Some("こんにちは世界".to_string()), Some("(こんにちは)(世界)".to_string()), Some(2)),
+            (
+                Some("こんにちは世界".to_string()),
+                Some("(こんにちは)(世界)".to_string()),
+                Some(2),
+            ),
             // Emoji characters
-            (Some("😀😃😄".to_string()), Some("(😀)(😃)(😄)".to_string()), Some(3)),
+            (
+                Some("😀😃😄".to_string()),
+                Some("(😀)(😃)(😄)".to_string()),
+                Some(3),
+            ),
             // Extremely large index
-            (Some("abc".to_string()), Some("(a)(b)(c)".to_string()), Some(999)),
+            (
+                Some("abc".to_string()),
+                Some("(a)(b)(c)".to_string()),
+                Some(999),
+            ),
             // Multiple matches (only first match is returned)
-            (Some("abc abc abc".to_string()), Some("(abc)".to_string()), Some(1)),
+            (
+                Some("abc abc abc".to_string()),
+                Some("(abc)".to_string()),
+                Some(1),
+            ),
             // Sequential capture groups (not truly overlapping)
-            (Some("abcde".to_string()), Some("(a)(b)(c)(d)(e)".to_string()), Some(2)),
+            (
+                Some("abcde".to_string()),
+                Some("(a)(b)(c)(d)(e)".to_string()),
+                Some(2),
+            ),
             // Nested capture groups
-            (Some("abcde".to_string()), Some("(a(b(c)d)e)".to_string()), Some(3)),
+            (
+                Some("abcde".to_string()),
+                Some("(a(b(c)d)e)".to_string()),
+                Some(3),
+            ),
             // Character classes
-            (Some("abc123".to_string()), Some("([a-z]+)([0-9]+)".to_string()), Some(1)),
+            (
+                Some("abc123".to_string()),
+                Some("([a-z]+)([0-9]+)".to_string()),
+                Some(1),
+            ),
             // Special regex syntax - non-capturing group
-            (Some("abc123".to_string()), Some("(a)(?:bc)(\\d+)".to_string()), Some(2)),
+            (
+                Some("abc123".to_string()),
+                Some("(a)(?:bc)(\\d+)".to_string()),
+                Some(2),
+            ),
         ];
 
         let expected = [
